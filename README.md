@@ -35,8 +35,9 @@ docker compose up --build
 ```
 
 服务监听 **8000** 端口，数据保存在命名卷 `gzip_ndjson_data` 中。
-数据库在容器启动时通过 `python -m app.init_db` 初始化（幂等，且会清理
-上次崩溃可能残留的暂存文件），随后启动 Uvicorn。
+数据库在容器启动时通过 `python -m app.init_db` 初始化（幂等：建表、
+把旧版 batches 表迁移为序号单调不复用的结构并保留原有数据与序号，
+清理上次崩溃可能残留的暂存文件），随后启动 Uvicorn。
 
 停止：`docker compose down`（数据卷保留；加 `-v` 同时删除数据）。
 
@@ -66,7 +67,8 @@ docker compose up --build
 application/gzip`，**不设置** `Content-Encoding`：gzip 是文件内容本身，
 不是传输层编码，客户端会原样落盘）。响应头附带
 `Content-Disposition: attachment; filename="batch-<batch_id>.json.gz"`，
-方便直接保存为文件。未知批次 ID 在**开始输出响应体之前**返回 `404`。
+方便直接保存为文件。未知或已删除批次 ID 在**开始输出响应体之前**返回
+`404`。
 
 解压后是 **UTF-8 NDJSON**：按批内 `seq` 升序，每行一个**仅含 `id`、
 `message`** 两个键的 JSON 对象，值与库内原文一致；引号、反斜杠、换行、
@@ -75,10 +77,33 @@ CRC32 与 ISIZE 结束尾部（`gzip -t` 可验）。
 
 服务端逐页（键集分页）读取记录、逐行序列化并逐块压缩下发：内存中任何
 时刻只有一页记录、一行序列化字节与压缩器缓冲，**不**攒齐整批 NDJSON、
-完整 gzip 文件或完整解压内容，也**不**生成完整临时文件。下载只执行只读
-短查询（WAL 下读不阻塞写），慢下载只阻塞自己的响应协程，不阻塞另一批
-上传提交，也不阻塞已完成批次的读取。客户端中途断连时游标与连接同样
-释放；下载全程不修改批次。
+完整 gzip 文件或完整解压内容，也**不**生成完整临时文件。整个下载在同一
+个**只读事务**（WAL 快照）内逐页读取，快照在 200 响应头发出之前建立：
+即使该批次随后被删除，本次下载仍按原顺序输出删除前的全部记录与完整
+gzip 尾部。读事务不持有写锁，慢下载只阻塞自己的响应协程，不阻塞该批次
+（或其他批次）的删除、另一批的上传提交，也不阻塞已完成批次的读取；
+代价是慢下载期间 WAL 文件不能被检查点完全回收（下载结束即恢复）。
+客户端中途断连时读事务、游标与连接同样释放。
+
+### `DELETE /batches/{batch_id}` — 永久删除批次
+
+永久删除一个**已提交**批次及其全部行，成功返回 `200`：
+
+```json
+{ "batch_id": "9f2c…(32位十六进制)", "line_count": 3 }
+```
+
+- 未知或已删除的批次 ID 返回 `404`。
+- 批次记录与全部行在**单个事务**内一同删除：任何失败都整体回滚、
+  全部保留，不会留下半删除状态。
+- 删除成功后，新请求不再列出、检索或统计这些行；按批次读取
+  （`GET /batches/{id}/lines`）与下载（`GET /batches/{id}/download`）
+  返回 `404`；重复统计的区间端点是被删批次时返回 `404`。
+- 已发出 `200` 响应头的进行中下载不受影响（其读快照仍含删除前全部
+  行，见上节）；慢下载不阻塞删除，删除也不阻塞其他批次的上传提交。
+- 旧检索游标续页时自动跳过已删记录；批次提交序号单调递增且**删除后
+  不复用**，因此删除最新乃至全部批次后再上传，新批次也不会进入
+  删除前签发的游标范围。
 
 ### `GET /logs/search` — 按 message 检索日志
 
@@ -95,15 +120,18 @@ CRC32 与 ISIZE 结束尾部（`gzip -t` 可验）。
   `next_cursor` 为下一页游标，末页为 `null`；无匹配时 `items` 为空且
   `next_cursor` 为 `null`。
 - 翻页期间新提交的批次不会混入进行中的查询；重新发起查询即可看到。
+  翻页期间被删除的批次，其行在续页中自动跳过；批次提交序号单调递增
+  且删除后不复用，即使删除最新乃至全部批次后再上传，新批次也不会
+  进入删除前签发的游标范围。
 - 游标无状态，服务重启后仍可续用；游标损坏或字段不合法返回 `422`。
   游标是 URL-safe Base64（去填充）编码的 JSON 对象
-  `{"v":1,"q":<查询词>,"bound":<批次范围上界>,"last":[<批次rowid>,<seq>]}`，
+  `{"v":1,"q":<查询词>,"bound":<批次范围上界>,"last":[<批次序号>,<seq>]}`，
   字段校验规则：`v` 只能是非布尔整数 `1`（`true`、`1.0`、`"1"` 均非法）；
   `bound` 与 `last` 两项只能是 `0～9223372036854775807`（SQLite int64
   上限）的非布尔整数；且 `last[0] ≤ bound`。违规游标在执行检索前即返回
   `422`，不会返回 `500` 或正常空页。
 - 检索按页做键集分页：不缓存全量命中行、不跨请求持有数据库事务，
-  WAL 下检索与上传提交互不阻塞。
+  WAL 下检索与上传提交、批次删除互不阻塞。
 
 ### `GET /logs/duplicates` — 批次区间内的重复消息
 
@@ -258,6 +286,54 @@ curl -sS -G http://localhost:8000/logs/search \
   --data-urlencode "cursor=$CUR" --data-urlencode 'page_size=1'
 ```
 
+### 删除批次及删除后续页
+
+```bash
+# 上传两个都含 "gone" 的批次
+printf '%s\n' \
+  '{"id":"a","message":"gone 1"}' \
+  '{"id":"b","message":"gone 2"}' | gzip -n > x1.json.gz
+B1=$(curl -sS -X POST http://localhost:8000/batches \
+  --data-binary @x1.json.gz | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+printf '%s\n' '{"id":"c","message":"gone 3"}' | gzip -n > x2.json.gz
+B2=$(curl -sS -X POST http://localhost:8000/batches \
+  --data-binary @x2.json.gz | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+
+# 首页取 1 条，拿到续页游标（此时范围含 B1、B2）
+CUR=$(curl -sS -G http://localhost:8000/logs/search \
+  --data-urlencode 'q=gone' --data-urlencode 'page_size=1' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"] or "")')
+
+# 删除 B2：返回被删批次 ID 与行数
+curl -sS -X DELETE http://localhost:8000/batches/$B2
+# 200 -> {"batch_id":"…","line_count":1}
+
+# 删除后：列表不含 B2，按批读取与下载均 404，检索不再命中其行
+curl -sS http://localhost:8000/batches
+curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:8000/batches/$B2/lines     # 404
+curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:8000/batches/$B2/download  # 404
+curl -sS -G http://localhost:8000/logs/search \
+  --data-urlencode 'q=gone 3' --data-urlencode 'page_size=10'
+# -> {"items":[],"next_cursor":null}
+
+# 旧游标续页：自动跳过已删记录（只剩 B1 的第 2 行，B2 的行不出现）
+curl -sS -G http://localhost:8000/logs/search \
+  --data-urlencode "cursor=$CUR" --data-urlencode 'page_size=10'
+# -> items 只有 {"id":"b","message":"gone 2"}，next_cursor 为 null
+
+# 删除最新批次后再上传：新批次不会进入旧游标范围（序号不复用），
+# 只有重新发起查询才能看到
+printf '%s\n' '{"id":"d","message":"gone 4"}' | gzip -n > x3.json.gz
+curl -sS -X POST http://localhost:8000/batches --data-binary @x3.json.gz
+curl -sS -G http://localhost:8000/logs/search \
+  --data-urlencode "cursor=$CUR" --data-urlencode 'page_size=10'
+# -> 仍只有 B1 的 "gone 2"；新批次的 "gone 4" 不在旧游标范围内
+
+# 重复删除或删除未知批次：404
+curl -sS -o /dev/null -w '%{http_code}\n' -X DELETE http://localhost:8000/batches/$B2   # 404
+curl -sS -o /dev/null -w '%{http_code}\n' -X DELETE http://localhost:8000/batches/deadbeef  # 404
+```
+
 ### 区间重复消息：上传三个批次并统计
 
 ```bash
@@ -385,9 +461,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 app/
   config.py     # 字节限制等配置
-  db.py         # SQLite 主库 + 每批次独立暂存库、原子发布、键集分页读取
+  db.py         # SQLite 主库（含旧库迁移、批次原子删除）+ 每批次独立暂存库
   ingest.py     # 流式 gzip/NDJSON 解析器（有界内存、立即超限、整批原子）
-  download.py   # 流式 gzip NDJSON 下载器（逐页读、逐块压缩、不攒整批）
+  download.py   # 流式 gzip NDJSON 下载器（WAL 快照逐页读、逐块压缩、不攒整批）
   main.py       # FastAPI 路由
   init_db.py    # 数据库初始化入口
 Dockerfile

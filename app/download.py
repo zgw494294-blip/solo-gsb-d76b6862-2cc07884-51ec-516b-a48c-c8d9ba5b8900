@@ -5,13 +5,21 @@
 内存里只有一页记录、一行序列化字节和压缩器缓冲，不会攒齐整批 NDJSON、
 完整压缩文件或完整解压结果，也不生成任何临时文件。
 
-下载只跑独立短查询（WAL 下读不阻塞写），SQLite 读取与 zlib 压缩都放在
-工作线程执行，慢下载只阻塞自己的响应协程，不阻塞事件循环，因此不阻塞
-另一批上传提交，也不阻塞已完成批次的读取。批次只增不改，下载全程只读。
+一致性：下载全程在同一个只读事务内逐页读取。WAL 快照隔离保证——只要
+快照在返回 200 响应头之前建立，即使该批次随后被删除，本下载仍按原顺序
+输出删除前的全部记录和完整 gzip 结束尾部；读事务不持有写锁，慢下载既
+不阻塞该批次（或其他批次）的删除，也不阻塞另一批的上传提交。代价是
+慢下载期间 WAL 文件不能被检查点完全回收（磁盘占用随并发写入增长，
+下载结束即恢复），这是快照隔离换取不阻塞的正常代价。
+
+SQLite 读取与 zlib 压缩都放在工作线程执行，慢下载只阻塞自己的响应协程，
+不阻塞事件循环。结束、出错或客户端断连都会回滚读事务并关闭连接。
 """
 from __future__ import annotations
 
 import json
+import sqlite3
+import weakref
 import zlib
 from typing import AsyncIterator
 
@@ -24,11 +32,27 @@ from . import db
 DOWNLOAD_PAGE_SIZE = 64
 
 
-class _GzipNdjsonStreamer:
-    """逐页读行、逐行序列化、逐块 gzip 压缩的小状态机（在线程中运行）。"""
+def _release_conn(conn: sqlite3.Connection) -> None:
+    """回滚只读事务并关闭连接（幂等，可在任意线程调用）。"""
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+    conn.close()
 
-    def __init__(self, batch_id: str) -> None:
-        self._conn = db.connect()
+
+class _GzipNdjsonStreamer:
+    """逐页读行、逐行序列化、逐块 gzip 压缩的小状态机（在线程中运行）。
+
+    连接上已开启只读事务（见 open_streamer），所有分页读取都落在同一
+    WAL 快照上；close() 回滚该事务并关闭连接。另经 weakref 终结器兜底：
+    即使异步生成器从未被启动（响应尚未开始迭代即被取消），连接也会随
+    流对象被回收而释放，不会泄漏读事务。
+    """
+
+    def __init__(self, conn: sqlite3.Connection, batch_id: str) -> None:
+        self._conn = conn
+        self._finalizer = weakref.finalize(self, _release_conn, conn)
         # wbits=31：gzip 封装；结束时由 flush() 写出 CRC32/ISIZE 校验尾部
         self._comp = zlib.compressobj(level=6, wbits=31)
         self._batch_id = batch_id
@@ -69,7 +93,7 @@ class _GzipNdjsonStreamer:
 
         chunk = self._comp.compress(bytes(payload)) if payload else b""
         if last_page:
-            # 空批不可能出现：上传时空批返回 422，下载前还做了 404 预检
+            # 空批不可能出现：上传时空批返回 422，下载前还做了存在性预检
             return chunk + self._finish(), True
         return chunk, False
 
@@ -81,17 +105,37 @@ class _GzipNdjsonStreamer:
         return self._comp.flush()
 
     def close(self) -> None:
-        """释放游标与数据库连接（正常结束、出错或客户端断连都必须调用）。"""
-        self._conn.close()
+        """释放快照连接（正常结束、出错或客户端断连都必须调用；幂等）。"""
+        self._finalizer()
 
 
-async def gzip_ndjson_stream(batch_id: str) -> AsyncIterator[bytes]:
+def open_streamer(batch_id: str) -> _GzipNdjsonStreamer | None:
+    """打开下载器并建立读快照；批次不存在（含已删除）返回 None。
+
+    必须在返回 200 响应头之前调用（在工作线程中运行）：BEGIN 后的首个
+    SELECT 即固定 WAL 快照，此后该批次即使被删除，本次下载仍能看到
+    删除前的全部行；响应头一旦发出，输出完整性就有了保证。
+    """
+    conn = db.connect()
+    try:
+        conn.execute("BEGIN")
+        if db.get_batch(conn, batch_id) is None:
+            _release_conn(conn)
+            return None
+        return _GzipNdjsonStreamer(conn, batch_id)
+    except Exception:
+        _release_conn(conn)
+        raise
+
+
+async def gzip_ndjson_stream(
+    streamer: _GzipNdjsonStreamer,
+) -> AsyncIterator[bytes]:
     """逐块产出该批次的完整 gzip 流的异步生成器。
 
-    连接在生成器创建时打开；无论正常结束、向客户端写入时出错（中途断连）
-    还是协程被取消，finally 都会关闭连接，游标随连接一并释放。
+    无论正常结束、向客户端写入时出错（中途断连）还是协程被取消，
+    finally 都会回滚读事务并关闭连接，快照与游标随之释放。
     """
-    streamer = await to_thread.run_sync(_GzipNdjsonStreamer, batch_id)
     try:
         while True:
             chunk, finished = await to_thread.run_sync(streamer.produce)

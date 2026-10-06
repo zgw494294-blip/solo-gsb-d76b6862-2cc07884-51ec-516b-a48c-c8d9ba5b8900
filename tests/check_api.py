@@ -809,6 +809,189 @@ def main():
               r.status_code == 200
               and gzip.decompress(b"".join(r.iter_bytes())) == dl_raw)
 
+    print("== 删除批次 ==")
+    dm = f"delmark{tok}"
+
+    def delete(bid):
+        return c.delete(f"{BASE}/batches/{bid}")
+
+    # 未知批次删除 -> 404
+    r = delete("deadbeef")
+    check("delete unknown -> 404", r.status_code == 404, r.status_code)
+
+    # 三个批次：消息互有重复，供删除后核对列表/检索/统计
+    dx1 = [{"id": "a", "message": f"{dm} alpha"}, {"id": "b", "message": f"{dm} shared"}]
+    dx2 = [{"id": "a", "message": f"{dm} shared"}, {"id": "b", "message": f"{dm} beta"}]
+    dx3 = [{"id": "a", "message": f"{dm} shared"}, {"id": "b", "message": f"{dm} gamma"}]
+    dxb = []
+    for recs in (dx1, dx2, dx3):
+        r = c.post("/batches", content=gz(ndjson(recs)))
+        check("delete fixture upload -> 201", r.status_code == 201, r.text[:120])
+        dxb.append(r.json()["batch_id"])
+    dx1_bid, dx2_bid, dx3_bid = dxb
+
+    # 删除中间批次：200 且返回被删批次 ID 与行数
+    r = delete(dx2_bid)
+    check("delete committed batch -> 200", r.status_code == 200, r.text[:150])
+    check("delete response body",
+          r.json() == {"batch_id": dx2_bid, "line_count": 2}, r.text)
+    # 已删除批次再删 -> 404
+    r = delete(dx2_bid)
+    check("re-delete -> 404", r.status_code == 404, r.status_code)
+
+    # 删除后：列表不再出现、按批读取与下载 404
+    check("deleted batch not listed", dx2_bid not in list_batch_ids()
+          and dx1_bid in list_batch_ids() and dx3_bid in list_batch_ids())
+    r = c.get(f"{BASE}/batches/{dx2_bid}/lines")
+    check("deleted batch lines -> 404", r.status_code == 404, r.status_code)
+    with c.stream("GET", f"{BASE}/batches/{dx2_bid}/download") as r:
+        check("deleted batch download -> 404 before body",
+              r.status_code == 404
+              and r.headers.get("content-type") == "application/json",
+              r.status_code)
+        check("deleted download has no gzip bytes", r.read()[:2] != b"\x1f\x8b")
+
+    # 删除后：检索不再命中被删行（shared 只剩 dx1/dx3 两条，beta 消失）
+    r = c.get("/logs/search", params={"q": f"{dm} shared", "page_size": 100})
+    got = [(i["batch_id"], i["seq"]) for i in r.json()["items"]]
+    check("search excludes deleted rows",
+          got == [(dx1_bid, 2), (dx3_bid, 1)], got)
+    r = c.get("/logs/search", params={"q": f"{dm} beta", "page_size": 100})
+    check("deleted-only message gone from search",
+          r.json()["items"] == [] and r.json()["next_cursor"] is None, r.text)
+
+    # 删除后：重复统计不再计入被删行（shared 原 3 次跨 3 批 -> 2 次跨 2 批）
+    r = c.get("/logs/duplicates",
+              params={"start_batch_id": dx1_bid, "end_batch_id": dx3_bid})
+    body = r.json()
+    check("duplicates exclude deleted rows",
+          [(i["message"], i["occurrences"], i["batch_count"]) for i in body["items"]]
+          == [(f"{dm} shared", 2, 2)] and body["total"] == 1, body)
+    # 区间端点是被删批次 -> 404
+    r = c.get("/logs/duplicates",
+              params={"start_batch_id": dx2_bid, "end_batch_id": dx3_bid})
+    check("duplicates with deleted endpoint -> 404", r.status_code == 404,
+          r.status_code)
+
+    # 旧检索游标续页跳过已删记录：先翻第一页，再删后续批次，续页不得出现它
+    r = c.get("/logs/search", params={"q": dm, "page_size": 2})
+    body = r.json()
+    check("delete-cursor page1",
+          [(i["batch_id"], i["id"]) for i in body["items"]]
+          == [(dx1_bid, "a"), (dx1_bid, "b")], body)
+    cur_del = body["next_cursor"]
+    check("delete-cursor page1 has cursor", bool(cur_del))
+    r = delete(dx3_bid)
+    check("delete newest marked batch -> 200", r.status_code == 200, r.text[:120])
+    r = c.get("/logs/search", params={"cursor": cur_del, "page_size": 10})
+    body = r.json()
+    check("old cursor skips deleted rows (dx3 gone)",
+          body["items"] == [] and body["next_cursor"] is None, body)
+
+    # 删除最新批次后再上传：新批次不得进入旧游标范围，新查询可见
+    dx4 = [{"id": "a", "message": f"{dm} revived"}]
+    r = c.post("/batches", content=gz(ndjson(dx4)))
+    check("re-upload after delete -> 201", r.status_code == 201, r.text[:120])
+    dx4_bid = r.json()["batch_id"]
+    r = c.get("/logs/search", params={"cursor": cur_del, "page_size": 10})
+    body = r.json()
+    check("old cursor still excludes new batch after delete+reupload",
+          body["items"] == [] and body["next_cursor"] is None, body)
+    r = c.get("/logs/search", params={"q": dm, "page_size": 100})
+    got = [(i["batch_id"], i["id"]) for i in r.json()["items"]]
+    check("new query sees remaining + revived batches",
+          got == [(dx1_bid, "a"), (dx1_bid, "b"), (dx4_bid, "a")], got)
+
+    # 删除全部批次后再上传：新批次仍不得进入旧游标范围
+    # （游标 cur_del 的上界是删除前的最大批次序号，序号不复用故必然成立）
+    for old_bid in list(list_batch_ids()):
+        r = delete(old_bid)
+        check("delete-all sweep -> 200", r.status_code == 200,
+              f"{old_bid}: {r.status_code}")
+    check("all batches deleted", list_batch_ids() == set(), list_batch_ids())
+    r = c.post("/batches", content=gz(ndjson([{"id": "n1", "message": f"{dm} after-all"}])))
+    check("upload after delete-all -> 201", r.status_code == 201, r.text[:120])
+    after_all_bid = r.json()["batch_id"]
+    r = c.get("/logs/search", params={"cursor": cur_del, "page_size": 10})
+    body = r.json()
+    check("old cursor empty after delete-all + reupload",
+          body["items"] == [] and body["next_cursor"] is None, body)
+    r = c.get("/logs/search", params={"q": f"{dm} after-all", "page_size": 10})
+    check("new query sees post-delete-all batch",
+          [i["batch_id"] for i in r.json()["items"]] == [after_all_bid], r.text)
+
+    print("== 并发：删除进行中的慢下载仍输出完整内容，且不阻塞删除与上传 ==")
+    # 不可压缩内容：客户端慢速读取让下载持续数秒；下载将被中途删除
+    doomed_recs = [
+        {"id": f"dd{i:06d}", "message": os.urandom(200).hex()}
+        for i in range(3000)
+    ]
+    doomed_payload = b"".join(
+        json.dumps(rec).encode() + b"\n" for rec in doomed_recs
+    )
+    r = c.post("/batches", content=gz(doomed_payload))
+    check("doomed download fixture -> 201", r.status_code == 201, r.text[:120])
+    doomed_bid = r.json()["batch_id"]
+
+    headers_seen = threading.Event()
+    doomed_dl = {}
+    def slow_download_doomed():
+        try:
+            with httpx.Client(base_url=BASE, timeout=60) as cc:
+                with cc.stream("GET",
+                               f"/batches/{doomed_bid}/download") as rr:
+                    doomed_dl["status"] = rr.status_code
+                    headers_seen.set()  # 200 响应头已收到
+                    buf = bytearray()
+                    for chunk in rr.iter_bytes():
+                        time.sleep(0.005)
+                        buf += chunk
+                    doomed_dl["gz"] = bytes(buf)
+        except Exception as e:
+            doomed_dl["e"] = repr(e)
+            headers_seen.set()
+
+    dt = threading.Thread(target=slow_download_doomed)
+    dt.start()
+    check("slow download got response headers", headers_seen.wait(timeout=10))
+    # 删除正在下载的批次本身：须立即成功，不被慢下载阻塞
+    t0 = time.time()
+    r = delete(doomed_bid)
+    del_ms = (time.time() - t0) * 1000
+    check("delete in-flight download batch fast -> 200",
+          r.status_code == 200 and r.json()["line_count"] == 3000
+          and del_ms < 3000, f"{r.status_code} {del_ms:.0f}ms")
+    # 慢下载进行中：另一批上传提交也不被阻塞
+    t0 = time.time()
+    r = c.post("/batches",
+               content=gz(ndjson([{"id": "during-dl", "message": "go"}])))
+    dl_post_ms = (time.time() - t0) * 1000
+    check("submit during slow download of deleted batch fast -> 201",
+          r.status_code == 201 and dl_post_ms < 3000,
+          f"{r.status_code} {dl_post_ms:.0f}ms")
+    dt.join()
+    # 已发 200 的下载：仍须按原顺序输出删除前全部记录与完整 gzip 尾部
+    check("doomed download completed with 200",
+          doomed_dl.get("status") == 200 and "gz" in doomed_dl
+          and "e" not in doomed_dl, str(doomed_dl))
+    if "gz" in doomed_dl:
+        # gzip.decompress 同时校验 CRC32 与 ISIZE 结束尾部
+        doomed_out = gzip.decompress(doomed_dl["gz"])
+        got_recs = [json.loads(l) for l in
+                    doomed_out.decode("utf-8").splitlines()]
+        check("doomed download has all 3000 pre-delete records in order",
+              got_recs == doomed_recs,
+              f"{len(got_recs)} rows")
+        check("doomed download keys exactly id/message",
+              all(set(rec) == {"id", "message"} for rec in got_recs))
+
+    # 删除后该批次读取/下载 404，列表不含它
+    r = c.get(f"{BASE}/batches/{doomed_bid}/lines")
+    check("doomed batch lines -> 404 after delete", r.status_code == 404)
+    r = c.get(f"{BASE}/batches/{doomed_bid}/download")
+    check("doomed batch download -> 404 after delete", r.status_code == 404)
+    check("doomed batch not listed", doomed_bid not in list_batch_ids())
+
     print("== 暂存清理 ==")
     import glob as _glob
     leftovers = _glob.glob(
