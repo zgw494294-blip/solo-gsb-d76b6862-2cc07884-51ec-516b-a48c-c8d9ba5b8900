@@ -119,13 +119,17 @@ def download_batch(batch_id: str) -> StreamingResponse:
     """把已提交批次下载为单个完整 gzip NDJSON 流。
 
     未知批次必须在开始响应（发送响应头/任何响应体字节）之前返回 404：
-    先用短连接确认批次存在，确认后才返回 StreamingResponse。
+    在同一连接里先确认批次存在，并在发出任何响应字节之前进入只读事务
+    固定 WAL 快照，确认后才返回 StreamingResponse。这样一旦 200 响应头
+    已发出，即使下载进行中该批次被 DELETE 永久删除，流内仍按原顺序输出
+    删除前的全部记录并写出完整 gzip CRC/ISIZE 尾部；而 WAL 下读不阻塞写，
+    慢下载不阻塞删除或另一批上传提交，下载结束/断连即提交事务释放快照。
     成功时 Content-Type 为 application/gzip，且不设置 Content-Encoding
     （gzip 是文件内容本身，不是传输层编码，客户端会原样保存）。
     """
-    with db.session() as conn:
-        if db.get_batch(conn, batch_id) is None:
-            raise HTTPException(status_code=404, detail="batch not found")
+    conn = db.open_download_snapshot(batch_id)
+    if conn is None:
+        raise HTTPException(status_code=404, detail="batch not found")
 
     # batch_id 为 32 位十六进制（uuid4.hex），放入 Content-Disposition
     # 无需考虑引号或非 ASCII 转义。
@@ -135,10 +139,30 @@ def download_batch(batch_id: str) -> StreamingResponse:
         )
     }
     return StreamingResponse(
-        download.gzip_ndjson_stream(batch_id),
+        download.gzip_ndjson_stream(conn, batch_id),
         media_type="application/gzip",
         headers=headers,
     )
+
+
+@app.delete("/batches/{batch_id}", status_code=200)
+def delete_batch(batch_id: str) -> dict[str, Any]:
+    """永久删除一个已提交批次：批次与其全部行在单事务内一同硬删除。
+
+    成功返回被删批次 ID 与行数；未知或此前已删除的批次返回 404。删除是
+    原子短事务：任一步失败整体回滚，批次与行全部保留。成功后该批次不再
+    出现在列表、检索与统计中，按批次读行/下载返回 404；旧检索游标续页
+    跳过被删记录。删除不等待进行中的慢下载（其持有删除前的只读快照），
+    也不阻塞其他批次上传提交。
+    """
+    with db.session() as conn:
+        try:
+            line_count = db.delete_batch(conn, batch_id)
+        except sqlite3.Error as exc:
+            raise HTTPException(status_code=500, detail=f"database error: {exc}")
+    if line_count is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+    return {"batch_id": batch_id, "line_count": line_count}
 
 
 # --------------------------------------------------------------------------- #
@@ -155,8 +179,9 @@ def find_duplicates(
 
     按 message 原文分组（保留大小写、空白与 Unicode 码点差异；不按 id
     去重，批内与跨批的每一行各计一次），只返回出现至少两次的分组。
-    批次只增不改，闭区间由两端批次的 rowid 固定，之后新提交的批次
-    rowid 更大，不会改变相同参数的结果；暂存中的批次不在主库，不参与。
+    闭区间由两端批次的 rowid 固定，之后新提交的批次 rowid 更大，不会
+    改变相同参数的结果；区间内批次若被删除，其行随之从统计中消失，
+    端点批次被删除则与未知批次一样返回 404；暂存中的批次不在主库，不参与。
     聚合、计数、排序与分页全部在 SQLite 内完成，不把区间日志载入 Python。
 
     - 任一 batch_id 未知：404（先于区间方向判断）
@@ -260,8 +285,10 @@ def search_logs(
 
     首页传 q（1~200 字符，空白原样保留）与 page_size（1~100），并固定
     当时已提交的批次范围；续页只传 cursor 与 page_size，沿用首页的查询词
-    与范围，翻页期间新提交的批次不会混入。每页一个短查询，不缓存全量命中、
-    不跨请求持有事务，WAL 下检索与上传提交互不阻塞。
+    与范围，翻页期间新提交的批次不会混入（提交序号 AUTOINCREMENT 单调
+    递增、删除也不复用，删光全部批次后再上传同样不会落入旧游标范围）。
+    范围内被永久删除的批次/行在续页时自然跳过。每页一个短查询，不缓存
+    全量命中、不跨请求持有事务，WAL 下检索与上传/删除互不阻塞。
     """
     if (q is None) == (cursor is None):
         raise HTTPException(
@@ -270,7 +297,8 @@ def search_logs(
     if cursor is not None:
         query, boundary, last = _decode_cursor(cursor)
     else:
-        # 首页：固定当前已提交批次范围（batches 最大 rowid；批次只增不改）
+        # 首页：固定当前已提交批次范围（batches 最大 rowid；rowid 单调
+        # 递增，删除乃至删空都不会复用）
         query, last = q, (0, 0)
         with db.session() as conn:
             boundary = db.committed_boundary(conn)

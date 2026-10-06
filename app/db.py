@@ -1,11 +1,19 @@
 """SQLite 持久化层。
 
 两级存储：
-- 主库（batches/lines）：只存放已提交批次，所有读取都只看主库。
+- 主库（batches/lines）：只存放已提交批次，所有读取都只看主库。批次可被
+  永久删除（DELETE 接口）：批次与其全部行在单个事务内硬删除；提交序号
+  （batches.rowid，即 rowid_seq）由 AUTOINCREMENT 分配，删除也绝不复用，
+  因此旧检索游标的 rowid 范围在删除/重建批次后仍然成立。
 - 每批次一个独立的临时 SQLite 文件（stage_<id>.db）：上传期间逐行落盘暂存。
   慢上传只写自己的临时文件，不与主库或其他批次争用任何锁；待 gzip 流完整
   结束、CRC 校验通过后，才以一个短事务把临时文件 ATTACH 进主库整体导入并
   提交——提交前外部对该批次完全不可见，提交失败则回滚并删除临时文件。
+
+下载在开始响应（发出 200 响应头）前即进入一个显式只读事务固定 WAL 快照：
+随后删除该批次不会打断已在进行的下载（快照里仍是删除前的完整内容），而
+WAL 下读事务不阻塞写，删除也不会被慢下载阻塞；下载结束（含断连）即提交/
+回滚该事务并关闭连接，持有的快照随之释放。
 
 连接使用 autocommit（isolation_level=None），事务边界显式控制。
 """
@@ -20,9 +28,13 @@ from typing import Iterator
 
 from . import config
 
+# batches 的建表语句。rowid_seq 即显式 rowid：AUTOINCREMENT 保证提交序号
+# 单调递增、删除（乃至删空）后也不复用旧序号——检索游标以该序号固定快照
+# 范围，新批次因此永远不会落入删除前签发的旧游标范围。
 _CREATE_BATCHES = """
 CREATE TABLE IF NOT EXISTS batches (
-    id         TEXT PRIMARY KEY,
+    rowid_seq  INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         TEXT NOT NULL UNIQUE,
     line_count INTEGER NOT NULL,
     created_at TEXT NOT NULL
 )
@@ -65,11 +77,19 @@ def connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """初始化数据库目录、表结构，并清理上次崩溃残留的暂存文件。"""
+    """初始化数据库目录、表结构，升级旧库，并清理残留暂存文件。
+
+    旧版本的 batches 表以 id 为主键、没有 AUTOINCREMENT；检测到这种结构时
+    原地迁移：保留每个批次的原始 rowid（即检索游标里使用的提交序号）与
+    lines 表不动，因此升级后旧数据与已签发的合法旧游标仍然有效。迁移是
+    单连接上的 DDL 事务（SQLite DDL 可事务化），失败则结构原样保留。
+    """
     os.makedirs(_db_dir(), exist_ok=True)
     os.makedirs(staging_dir(), exist_ok=True)
     conn = connect()
     try:
+        if _batches_needs_migration(conn):
+            _migrate_batches(conn)
         conn.execute(_CREATE_BATCHES)
         conn.execute(_CREATE_LINES)
         conn.execute(_CREATE_LINE_BATCH_INDEX)
@@ -80,6 +100,39 @@ def init_db() -> None:
             os.remove(path)
         except OSError:
             pass
+
+
+def _batches_needs_migration(conn: sqlite3.Connection) -> bool:
+    """旧版 batches（id 为 PRIMARY KEY、rowid 无 AUTOINCREMENT）需迁移。"""
+    schema = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='batches'"
+    ).fetchone()
+    if schema is None or not schema[0]:
+        return False
+    return "AUTOINCREMENT" not in schema[0].upper()
+
+
+def _migrate_batches(conn: sqlite3.Connection) -> None:
+    """把旧 batches 表迁到 AUTOINCREMENT 结构，逐行保留原 rowid。
+
+    显式插入旧 rowid 后，sqlite_sequence 会记下最大序号，之后新批次的序号
+    从该最大值继续分配；lines 通过批次 id 关联，内容无需改动。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("ALTER TABLE batches RENAME TO batches_old")
+        conn.execute(_CREATE_BATCHES)
+        conn.execute(
+            """
+            INSERT INTO batches (rowid_seq, id, line_count, created_at)
+            SELECT rowid, id, line_count, created_at FROM batches_old
+            """
+        )
+        conn.execute("DROP TABLE batches_old")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def list_batches(
@@ -112,6 +165,58 @@ def get_batch_rowid(conn: sqlite3.Connection, batch_id: str) -> int | None:
         (batch_id,),
     ).fetchone()
     return row["r"] if row is not None else None
+
+
+def delete_batch(conn: sqlite3.Connection, batch_id: str) -> int | None:
+    """永久删除批次及其全部行，返回被删行数；未知/已删除批次返回 None。
+
+    批次行与批次记录在同一个 IMMEDIATE 事务内删除：任何一步失败都整体
+    回滚，数据全部保留。WAL 下删除是一个短写事务，不等待慢下载的读事务，
+    也不阻塞其他批次上传提交。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT line_count FROM batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            return None
+        line_count = row["line_count"]
+        conn.execute("DELETE FROM lines WHERE batch_id = ?", (batch_id,))
+        conn.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    return line_count
+
+
+def open_download_snapshot(batch_id: str) -> sqlite3.Connection:
+    """下载用：确认批次存在并立即进入只读事务固定删除前快照。
+
+    必须在发出任何响应字节（200 响应头）之前调用：事务一旦开始，WAL 的
+    读快照即固定，之后该批次被 DELETE 删除，本连接仍按删除前的完整内容
+    逐页读取，gzip CRC/ISIZE 尾部照常生成。未知/已删除批次返回 None（此时
+    尚未开始任何事务，连接直接关闭，由路由返回 404）。
+
+    返回的连接由下载流持有：正常结束时 COMMIT、异常或客户端断连时
+    ROLLBACK/关闭，快照随即释放。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        if conn.execute(
+            "SELECT 1 FROM batches WHERE id = ?", (batch_id,)
+        ).fetchone() is None:
+            conn.execute("ROLLBACK")
+            conn.close()
+            return None
+    except Exception:
+        conn.close()
+        raise
+    return conn
 
 
 def get_lines(
@@ -152,8 +257,10 @@ def iter_batch_lines(
 def committed_boundary(conn: sqlite3.Connection) -> int:
     """当前已提交批次范围的上界（batches 的最大 rowid，无批次时为 0）。
 
-    批次只增不改、rowid 即提交顺序：固定该上界后，之后提交的批次
-    （rowid 更大）不会混入基于该边界的检索，新查询重新取边界即可看到。
+    rowid 由 AUTOINCREMENT 分配：提交顺序单调递增，删除（乃至删空全部
+    批次）后也不复用旧序号。固定该上界后，之后提交的批次（rowid 更大）
+    不会混入基于该边界的检索，新查询重新取边界即可看到；删除只让范围
+    内的部分批次消失，旧游标续页时自然跳过它们。
     """
     return conn.execute(
         "SELECT COALESCE(MAX(rowid), 0) AS m FROM batches"

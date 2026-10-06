@@ -5,13 +5,17 @@
 内存里只有一页记录、一行序列化字节和压缩器缓冲，不会攒齐整批 NDJSON、
 完整压缩文件或完整解压结果，也不生成任何临时文件。
 
-下载只跑独立短查询（WAL 下读不阻塞写），SQLite 读取与 zlib 压缩都放在
-工作线程执行，慢下载只阻塞自己的响应协程，不阻塞事件循环，因此不阻塞
-另一批上传提交，也不阻塞已完成批次的读取。批次只增不改，下载全程只读。
+下载连接在发出 200 响应头之前就已进入一个显式只读事务（见
+db.open_download_snapshot），固定 WAL 读快照：下载期间该批次即使被永久
+删除，流内读到的仍是删除前的全部记录（顺序不变），gzip CRC32/ISIZE 尾部
+照常写出；而 WAL 下读事务不阻塞写，慢下载不阻塞删除、另一批上传提交或
+已完成批次的读取。正常结束（COMMIT）、出错（ROLLBACK）或客户端断连都会
+关闭连接、释放快照。
 """
 from __future__ import annotations
 
 import json
+import sqlite3
 import zlib
 from typing import AsyncIterator
 
@@ -27,8 +31,10 @@ DOWNLOAD_PAGE_SIZE = 64
 class _GzipNdjsonStreamer:
     """逐页读行、逐行序列化、逐块 gzip 压缩的小状态机（在线程中运行）。"""
 
-    def __init__(self, batch_id: str) -> None:
-        self._conn = db.connect()
+    def __init__(self, conn: sqlite3.Connection, batch_id: str) -> None:
+        # conn 已由路由在响应头发出前置入只读事务，持有删除前快照；
+        # 本对象负责在结束时提交/回滚该事务并关闭连接。
+        self._conn = conn
         # wbits=31：gzip 封装；结束时由 flush() 写出 CRC32/ISIZE 校验尾部
         self._comp = zlib.compressobj(level=6, wbits=31)
         self._batch_id = batch_id
@@ -81,17 +87,31 @@ class _GzipNdjsonStreamer:
         return self._comp.flush()
 
     def close(self) -> None:
-        """释放游标与数据库连接（正常结束、出错或客户端断连都必须调用）。"""
-        self._conn.close()
+        """结束只读快照事务并释放连接（正常结束、出错或客户端断连都调用）。"""
+        try:
+            # 只读事务用 COMMIT 结束即可；若产流中途出错导致事务状态异常，
+            # ROLLBACK 兜底，随后关闭连接释放 WAL 快照。
+            try:
+                self._conn.execute("COMMIT")
+            except sqlite3.Error:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+        finally:
+            self._conn.close()
 
 
-async def gzip_ndjson_stream(batch_id: str) -> AsyncIterator[bytes]:
+async def gzip_ndjson_stream(
+    conn: sqlite3.Connection, batch_id: str
+) -> AsyncIterator[bytes]:
     """逐块产出该批次的完整 gzip 流的异步生成器。
 
-    连接在生成器创建时打开；无论正常结束、向客户端写入时出错（中途断连）
-    还是协程被取消，finally 都会关闭连接，游标随连接一并释放。
+    conn 是路由在发出响应头前打开的快照连接（已在事务中）。无论正常结束、
+    向客户端写入时出错（中途断连）还是协程被取消，finally 都会提交/回滚
+    事务并关闭连接，游标与持有的快照随连接一并释放。
     """
-    streamer = await to_thread.run_sync(_GzipNdjsonStreamer, batch_id)
+    streamer = await to_thread.run_sync(_GzipNdjsonStreamer, conn, batch_id)
     try:
         while True:
             chunk, finished = await to_thread.run_sync(streamer.produce)
